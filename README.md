@@ -13,7 +13,7 @@ Fork / working copy of [basketikun/infinite-canvas](https://github.com/basketiku
 ├── Dockerfile
 ├── docker-compose.yml
 ├── nginx.conf
-└── FIX-OUTPUT-FORMAT.md # Patch notes
+└── FIXES.md # Patch notes
 ```
 
 ## Fix included
@@ -52,3 +52,4 @@ Default: `http://localhost:3000`
 
 - Browser storage holds API keys / canvas data by default
 - If a normal browser still shows the old `output_format` error, hard-refresh or clear site data for the canvas domain; custom channel scripts can also inject that field
+
