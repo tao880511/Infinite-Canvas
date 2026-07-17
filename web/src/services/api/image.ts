@@ -94,6 +94,7 @@ type GeminiStreamState = { buffer: string; text: string; toolCalls: ResponseTool
 type RequestOptions = { signal?: AbortSignal };
 
 const QUALITY_BASE: Record<string, number> = {
+    // Keep low usable for OpenAI-like models, but Seedream path enforces 3686400 separately.
     low: 1024,
     medium: 2048,
     high: 2880,
@@ -108,6 +109,8 @@ const QUALITY_ALIASES: Record<string, string> = {
 const DEFAULT_IMAGE_SHORT_SIDE = 1024;
 const IMAGE_SIZE_STEP = 16;
 const IMAGE_MIN_PIXELS = 655360;
+// Seedream / 火山方舟要求总像素至少 1920x1920
+const SEEDREAM_MIN_PIXELS = 3686400;
 const IMAGE_MAX_PIXELS = 8294400;
 const IMAGE_MAX_EDGE = 3840;
 const IMAGE_MAX_RATIO = 3;
@@ -121,8 +124,36 @@ function normalizeQuality(quality: string) {
     return QUALITY_BASE[normalized] ? normalized : undefined;
 }
 
+function isSeedreamModel(model: string | undefined, baseUrl?: string) {
+    // Volcengine/Ark endpoint IDs often look like "ep-xxxx" and do not contain "seedream".
+    const haystack = `${model || ""} ${baseUrl || ""}`.toLowerCase();
+    return /seedream|doubao|volces|volcengine|\bark\b|ark\.cn|ep-/.test(haystack);
+}
+
+function alignToStep(value: number) {
+    return Math.max(IMAGE_SIZE_STEP, Math.round(value / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP);
+}
+
+/** Scale width/height up until total pixels meet a provider minimum, keeping aspect ratio and 16-step edges. */
+function ensureMinPixels(width: number, height: number, minPixels: number) {
+    let nextWidth = alignToStep(width);
+    let nextHeight = alignToStep(height);
+    if (nextWidth * nextHeight >= minPixels) return { width: nextWidth, height: nextHeight };
+
+    const scale = Math.sqrt(minPixels / Math.max(1, nextWidth * nextHeight));
+    nextWidth = alignToStep(nextWidth * scale);
+    nextHeight = alignToStep(nextHeight * scale);
+
+    // Rounding can still undershoot; bump the longer edge until we clear the floor.
+    while (nextWidth * nextHeight < minPixels) {
+        if (nextWidth >= nextHeight) nextWidth += IMAGE_SIZE_STEP;
+        else nextHeight += IMAGE_SIZE_STEP;
+        if (Math.max(nextWidth, nextHeight) > IMAGE_MAX_EDGE) break;
+    }
+    return { width: nextWidth, height: nextHeight };
+}
 /** Map "quality + ratio" to an explicit pixel dimension like "3840x2160". */
-function resolveSize(quality: string | undefined, ratio: string): string {
+function resolveSize(quality: string | undefined, ratio: string, minPixels = IMAGE_MIN_PIXELS): string {
     const parsedRatio = parseImageRatio(ratio);
     const basePixels = quality ? QUALITY_BASE[quality] : undefined;
     const isLandscape = parsedRatio.width >= parsedRatio.height;
@@ -131,18 +162,21 @@ function resolveSize(quality: string | undefined, ratio: string): string {
     let shortSide: number;
 
     if (basePixels) {
-        const targetPixels = basePixels * basePixels;
+        const targetPixels = Math.max(basePixels * basePixels, minPixels);
         const longSideRaw = Math.sqrt(targetPixels * longRatio);
         longSide = Math.floor(longSideRaw / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
         shortSide = Math.round(longSide / longRatio / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
     } else {
-        shortSide = DEFAULT_IMAGE_SHORT_SIDE;
+        // When quality is auto, still honor provider min-pixel floors (e.g. Seedream 1920^2).
+        const shortSideRaw = Math.sqrt(Math.max(DEFAULT_IMAGE_SHORT_SIDE * DEFAULT_IMAGE_SHORT_SIDE, minPixels) / longRatio);
+        shortSide = Math.floor(shortSideRaw / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
         longSide = Math.round((shortSide * longRatio) / IMAGE_SIZE_STEP) * IMAGE_SIZE_STEP;
     }
 
-    const width = isLandscape ? longSide : shortSide;
-    const height = isLandscape ? shortSide : longSide;
-    validateImageSize(width, height);
+    let width = isLandscape ? longSide : shortSide;
+    let height = isLandscape ? shortSide : longSide;
+    ({ width, height } = ensureMinPixels(width, height, minPixels));
+    validateImageSize(width, height, minPixels);
     return `${width}x${height}`;
 }
 
@@ -167,24 +201,30 @@ function parseImageDimensions(value: string) {
     return { width: Number(match[1]), height: Number(match[2]) };
 }
 
-function validateImageSize(width: number, height: number) {
+function validateImageSize(width: number, height: number, minPixels = IMAGE_MIN_PIXELS) {
     if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) throw new Error("图像尺寸必须是正整数，例如 1024x1024");
     if (width % IMAGE_SIZE_STEP !== 0 || height % IMAGE_SIZE_STEP !== 0) throw new Error("图像尺寸的宽高必须是 16 的倍数，请调整尺寸");
     if (Math.max(width, height) > IMAGE_MAX_EDGE) throw new Error("图像尺寸最长边不能超过 3840px，请调整尺寸");
     if (Math.max(width, height) / Math.min(width, height) > IMAGE_MAX_RATIO) throw new Error("图像宽高比不能超过 3:1，请调整尺寸");
     const pixels = width * height;
-    if (pixels < IMAGE_MIN_PIXELS || pixels > IMAGE_MAX_PIXELS) throw new Error("图像总像素需在 655360 到 8294400 之间，请调整尺寸");
+    if (pixels < minPixels || pixels > IMAGE_MAX_PIXELS) throw new Error(`图像总像素需在 ${minPixels} 到 ${IMAGE_MAX_PIXELS} 之间，请调整尺寸`);
 }
 
-function resolveRequestSize(quality: string | undefined, size: string) {
+function resolveRequestSize(quality: string | undefined, size: string, model?: string, baseUrl?: string) {
+    const seedreamLike = isSeedreamModel(model, baseUrl);
+    const minPixels = seedreamLike ? SEEDREAM_MIN_PIXELS : IMAGE_MIN_PIXELS;
     const value = size.trim();
-    if (!value || value.toLowerCase() === "auto") return undefined;
+    // Seedream rejects missing/too-small size; auto must still resolve to a legal dimension.
+    if (!value || value.toLowerCase() === "auto") {
+        return seedreamLike ? resolveSize(quality || "medium", "1:1", minPixels) : undefined;
+    }
     const dimensions = parseImageDimensions(value);
     if (dimensions) {
-        validateImageSize(dimensions.width, dimensions.height);
-        return `${dimensions.width}x${dimensions.height}`;
+        const scaled = ensureMinPixels(dimensions.width, dimensions.height, minPixels);
+        validateImageSize(scaled.width, scaled.height, minPixels);
+        return `${scaled.width}x${scaled.height}`;
     }
-    if (value.includes(":")) return resolveSize(quality, value);
+    if (value.includes(":")) return resolveSize(quality || (seedreamLike ? "medium" : undefined), value, minPixels);
     throw new Error("图像尺寸格式不支持，请使用 auto、9:16 或 1024x1024");
 }
 
@@ -659,7 +699,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
     const script = resolveModelScript(config, config.model || config.imageModel);
     if (script) {
         const quality = normalizeQuality(config.quality);
-        const requestSize = resolveRequestSize(quality, config.size);
+        const requestSize = resolveRequestSize(quality, config.size, requestConfig.model, requestConfig.baseUrl);
         try {
             const result = await runModelPlugin({
                 capability: "image",
@@ -683,7 +723,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
         }
     }
     const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(quality, config.size);
+    const requestSize = resolveRequestSize(quality, config.size, requestConfig.model, requestConfig.baseUrl);
     try {
         const response = await axios.post<ImageApiResponse>(
             aiApiUrl(requestConfig, "/images/generations"),
@@ -714,7 +754,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     const script = resolveModelScript(config, config.model || config.imageModel);
     if (script) {
         const quality = normalizeQuality(config.quality);
-        const requestSize = resolveRequestSize(quality, config.size);
+        const requestSize = resolveRequestSize(quality, config.size, requestConfig.model, requestConfig.baseUrl);
         const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
         try {
             const result = await runModelPlugin({
@@ -740,7 +780,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         }
     }
     const quality = normalizeQuality(config.quality);
-    const requestSize = resolveRequestSize(quality, config.size);
+    const requestSize = resolveRequestSize(quality, config.size, requestConfig.model, requestConfig.baseUrl);
     const formData = new FormData();
     formData.set("model", requestConfig.model);
     formData.set("prompt", withSystemPrompt(requestConfig, requestPrompt));

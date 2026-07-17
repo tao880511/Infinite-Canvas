@@ -97,7 +97,7 @@ export const defaultConfig: AiConfig = {
     videoWatermark: "false",
     systemPrompt: "",
     models: ["default::gpt-image-2", "default::grok-imagine-video", "default::gpt-5.5", "default::gpt-4o-mini-tts"],
-    quality: "auto",
+    quality: "medium",
     size: "1:1",
     count: "1",
     canvasImageCount: "3",
