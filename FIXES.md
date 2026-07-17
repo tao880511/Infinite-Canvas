@@ -1,4 +1,4 @@
-﻿# Local fixes in this fork
+# Local fixes in this fork
 
 ## Seedream `output_format` fix
 
@@ -31,3 +31,19 @@ The parameter `size` specified in the request is not valid: image size must be a
 - auto-scales ratio / pixel sizes up to the minimum
 - always sends an explicit legal `size` for Seedream-like models (including `auto`)
 - defaults image quality to `medium` for safer first-run sizes
+
+
+## Multi-provider image edit compatibility
+
+Some OpenAI-compatible gateways (including Agnes and several relay ports) accept `/images/edits` but reject multipart file uploads with errors like:
+
+```text
+agnes image edits require an image URL in image or extra_body.image; file uploads are not supported
+```
+
+`web/src/services/api/image.ts` now:
+
+- detects URL-style image-edit providers by model / base URL / channel name
+- sends JSON body with `image`, `images`, `image_url`, `image_urls`, and `extra_body.image`
+- keeps classic OpenAI multipart FormData for standard providers
+- auto-retries with the URL JSON body when a multipart upload is rejected

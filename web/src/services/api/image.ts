@@ -1,6 +1,6 @@
 import axios from "axios";
 
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, resolveModelChannel, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
 import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
@@ -122,6 +122,71 @@ function normalizeQuality(quality: string) {
     const value = quality.trim().toLowerCase();
     const normalized = QUALITY_ALIASES[value] || value;
     return QUALITY_BASE[normalized] ? normalized : undefined;
+}
+
+
+function isUrlImageEditProvider(model?: string, baseUrl?: string, channelName?: string) {
+    // Prefer JSON image URLs only for providers known to reject multipart uploads.
+    // Other OpenAI-compatible ports still start with FormData and auto-retry on upload errors.
+    const haystack = `${model || ""} ${baseUrl || ""} ${channelName || ""}`.toLowerCase();
+    return /agnes|url[-_ ]?image|image[-_ ]?url|json[-_ ]?edit|extra_body\.image/.test(haystack);
+}
+
+function isPublicImageUrl(value: string) {
+    return /^https?:\/\//i.test(value.trim());
+}
+
+function isDataImageUrl(value: string) {
+    return /^data:image\//i.test(value.trim());
+}
+
+async function resolveProviderImageUrl(image: ReferenceImage) {
+    const candidates = [image.url, image.dataUrl].filter((value): value is string => Boolean(value && value.trim()));
+    for (const candidate of candidates) {
+        const value = candidate.trim();
+        if (isPublicImageUrl(value) || isDataImageUrl(value)) return value;
+    }
+    const dataUrl = (await imageToDataUrl(image)).trim();
+    if (!dataUrl) throw new Error("参考图无法转换为可用的图片地址");
+    return dataUrl;
+}
+
+function buildUrlImageEditBody(params: {
+    model: string;
+    prompt: string;
+    n: number;
+    quality?: string;
+    size?: string;
+    imageUrls: string[];
+    maskUrl?: string;
+}) {
+    const primary = params.imageUrls[0];
+    const extraBody: Record<string, unknown> = {
+        image: primary,
+        images: params.imageUrls,
+    };
+    if (params.maskUrl) extraBody.mask = params.maskUrl;
+
+    // Cover common OpenAI-compatible gateway field names without relying on multipart uploads.
+    return {
+        model: params.model,
+        prompt: params.prompt,
+        n: params.n,
+        response_format: "b64_json",
+        image: primary,
+        images: params.imageUrls,
+        image_url: primary,
+        image_urls: params.imageUrls,
+        ...(params.maskUrl ? { mask: params.maskUrl, mask_url: params.maskUrl } : {}),
+        extra_body: extraBody,
+        ...(params.quality ? { quality: params.quality } : {}),
+        ...(params.size ? { size: params.size } : {}),
+    };
+}
+
+function shouldRetryImageEditWithUrlBody(error: unknown) {
+    const message = readAxiosError(error, "").toLowerCase();
+    return /image url|extra_body\.image|file uploads are not supported|multipart|form-?data|require an image url|must be a url|image must be a string|invalid image|unsupported media type|content-type/.test(message);
 }
 
 function isSeedreamModel(model: string | undefined, baseUrl?: string) {
@@ -749,6 +814,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
 
 export async function requestEdit(config: AiConfig, prompt: string, references: ReferenceImage[], mask?: ReferenceImage, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
+    const requestChannel = resolveModelChannel(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const requestPrompt = buildImageReferencePromptText(prompt, references);
     const script = resolveModelScript(config, config.model || config.imageModel);
@@ -779,27 +845,60 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             throw new Error(readAxiosError(error, "请求失败"));
         }
     }
+    if (!references.length) throw new Error("图生图至少需要一张参考图");
+
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size, requestConfig.model, requestConfig.baseUrl);
-    const formData = new FormData();
-    formData.set("model", requestConfig.model);
-    formData.set("prompt", withSystemPrompt(requestConfig, requestPrompt));
-    formData.set("n", String(n));
-    formData.set("response_format", "b64_json");
-    if (quality) {
-        formData.set("quality", quality);
-    }
-    if (requestSize) {
-        formData.set("size", requestSize);
-    }
-    const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
-    files.forEach((file) => formData.append("image", file));
-    if (mask) formData.set("mask", dataUrlToFile(mask));
+    const finalPrompt = withSystemPrompt(requestConfig, requestPrompt);
+    const preferUrlBody = isUrlImageEditProvider(requestConfig.model, requestConfig.baseUrl, requestChannel.name);
+
+    const postUrlImageEdit = async () => {
+        const imageUrls = await Promise.all(references.map((image) => resolveProviderImageUrl(image)));
+        const maskUrl = mask ? await resolveProviderImageUrl(mask) : undefined;
+        const body = buildUrlImageEditBody({
+            model: requestConfig.model,
+            prompt: finalPrompt,
+            n,
+            quality,
+            size: requestSize,
+            imageUrls,
+            maskUrl,
+        });
+        const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), body, {
+            headers: aiHeaders(requestConfig, "application/json"),
+            signal: options?.signal,
+        });
+        return parseImagePayload(response.data);
+    };
+
+    const postMultipartImageEdit = async () => {
+        const formData = new FormData();
+        formData.set("model", requestConfig.model);
+        formData.set("prompt", finalPrompt);
+        formData.set("n", String(n));
+        formData.set("response_format", "b64_json");
+        if (quality) formData.set("quality", quality);
+        if (requestSize) formData.set("size", requestSize);
+        const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
+        files.forEach((file) => formData.append("image", file));
+        if (mask) formData.set("mask", dataUrlToFile({ ...mask, dataUrl: await imageToDataUrl(mask) }));
+        const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), formData, {
+            headers: aiHeaders(requestConfig),
+            signal: options?.signal,
+        });
+        return parseImagePayload(response.data);
+    };
 
     try {
-        const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), formData, { headers: aiHeaders(requestConfig), signal: options?.signal });
-        const images = parseImagePayload(response.data);
-        return images;
+        // URL-first for gateways like Agnes; keep classic OpenAI multipart for others.
+        if (preferUrlBody) return await postUrlImageEdit();
+        try {
+            return await postMultipartImageEdit();
+        } catch (error) {
+            // Auto-compat: if a custom port/gateway rejects file upload, retry with image URL JSON.
+            if (!shouldRetryImageEditWithUrlBody(error)) throw error;
+            return await postUrlImageEdit();
+        }
     } catch (error) {
         throw new Error(readAxiosError(error, "请求失败"));
     }
