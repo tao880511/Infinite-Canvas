@@ -47,3 +47,25 @@ agnes image edits require an image URL in image or extra_body.image; file upload
 - sends JSON body with `image`, `images`, `image_url`, `image_urls`, and `extra_body.image`
 - keeps classic OpenAI multipart FormData for standard providers
 - auto-retries with the URL JSON body when a multipart upload is rejected
+
+
+## Grok / JSON-only image edit compatibility
+
+Some gateways (including Grok / xAI style ports) reject multipart image edits with:
+
+```text
+??????? application/json
+```
+
+or reject OpenAI-style pixel sizes with:
+
+```text
+aspect_ratio ????
+```
+
+`web/src/services/api/image.ts` now:
+
+- treats Grok / xAI / Agnes style providers as JSON image-edit providers
+- sends image URL JSON for those providers instead of FormData
+- maps pixel sizes such as `1536x1024` to `aspect_ratio: "3:2"` for Grok
+- auto-retries multipart failures that mention `application/json`

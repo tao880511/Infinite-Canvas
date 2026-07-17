@@ -125,11 +125,19 @@ function normalizeQuality(quality: string) {
 }
 
 
+function providerHaystack(model?: string, baseUrl?: string, channelName?: string) {
+    return `${model || ""} ${baseUrl || ""} ${channelName || ""}`.toLowerCase();
+}
+
+function isGrokImageProvider(model?: string, baseUrl?: string, channelName?: string) {
+    return /grok|x\.ai|\bxai\b/.test(providerHaystack(model, baseUrl, channelName));
+}
+
 function isUrlImageEditProvider(model?: string, baseUrl?: string, channelName?: string) {
-    // Prefer JSON image URLs only for providers known to reject multipart uploads.
+    // Prefer JSON image URLs for providers known to reject multipart uploads.
     // Other OpenAI-compatible ports still start with FormData and auto-retry on upload errors.
-    const haystack = `${model || ""} ${baseUrl || ""} ${channelName || ""}`.toLowerCase();
-    return /agnes|url[-_ ]?image|image[-_ ]?url|json[-_ ]?edit|extra_body\.image/.test(haystack);
+    const haystack = providerHaystack(model, baseUrl, channelName);
+    return isGrokImageProvider(model, baseUrl, channelName) || /agnes|url[-_ ]?image|image[-_ ]?url|json[-_ ]?edit|extra_body\.image|application\/json/.test(haystack);
 }
 
 function isPublicImageUrl(value: string) {
@@ -151,6 +159,65 @@ async function resolveProviderImageUrl(image: ReferenceImage) {
     return dataUrl;
 }
 
+const GROK_ASPECT_RATIOS = ["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "2:1", "1:2", "21:9", "9:21"] as const;
+
+function gcd(a: number, b: number): number {
+    let x = Math.abs(Math.round(a));
+    let y = Math.abs(Math.round(b));
+    while (y) {
+        const next = x % y;
+        x = y;
+        y = next;
+    }
+    return x || 1;
+}
+
+function simplifyRatio(width: number, height: number) {
+    const factor = gcd(width, height);
+    return `${Math.max(1, Math.round(width / factor))}:${Math.max(1, Math.round(height / factor))}`;
+}
+
+function closestAspectRatio(width: number, height: number, ratios: readonly string[] = GROK_ASPECT_RATIOS) {
+    const target = width / Math.max(1, height);
+    return ratios.reduce((best, item) => {
+        const [w, h] = item.split(":").map(Number);
+        const current = w / Math.max(1, h);
+        const bestParts = best.split(":").map(Number);
+        const bestRatio = bestParts[0] / Math.max(1, bestParts[1]);
+        return Math.abs(current - target) < Math.abs(bestRatio - target) ? item : best;
+    }, ratios[0]);
+}
+
+function resolveAspectRatio(size?: string) {
+    if (!size) return undefined;
+    const value = size.trim();
+    if (!value || value.toLowerCase() === "auto") return "auto";
+    if (/^\d+:\d+$/.test(value)) {
+        const [width, height] = value.split(":").map(Number);
+        return closestAspectRatio(width, height);
+    }
+    const dimensions = parseImageDimensions(value);
+    if (!dimensions) return undefined;
+    const simplified = simplifyRatio(dimensions.width, dimensions.height);
+    if ((GROK_ASPECT_RATIOS as readonly string[]).includes(simplified)) return simplified;
+    return closestAspectRatio(dimensions.width, dimensions.height);
+}
+
+function buildImageGeometryFields(size: string | undefined, model?: string, baseUrl?: string, channelName?: string) {
+    const aspectRatio = resolveAspectRatio(size);
+    const grokLike = isGrokImageProvider(model, baseUrl, channelName);
+    if (grokLike) {
+        // Grok / xAI gateways often reject OpenAI `size` and only accept aspect_ratio.
+        return {
+            ...(aspectRatio ? { aspect_ratio: aspectRatio, aspectRatio } : {}),
+        };
+    }
+    // Keep classic OpenAI/Seedream geometry: pixel `size` only.
+    return {
+        ...(size ? { size } : {}),
+    };
+}
+
 function buildUrlImageEditBody(params: {
     model: string;
     prompt: string;
@@ -159,11 +226,15 @@ function buildUrlImageEditBody(params: {
     size?: string;
     imageUrls: string[];
     maskUrl?: string;
+    baseUrl?: string;
+    channelName?: string;
 }) {
     const primary = params.imageUrls[0];
+    const geometry = buildImageGeometryFields(params.size, params.model, params.baseUrl, params.channelName);
     const extraBody: Record<string, unknown> = {
         image: primary,
         images: params.imageUrls,
+        ...geometry,
     };
     if (params.maskUrl) extraBody.mask = params.maskUrl;
 
@@ -180,13 +251,13 @@ function buildUrlImageEditBody(params: {
         ...(params.maskUrl ? { mask: params.maskUrl, mask_url: params.maskUrl } : {}),
         extra_body: extraBody,
         ...(params.quality ? { quality: params.quality } : {}),
-        ...(params.size ? { size: params.size } : {}),
+        ...geometry,
     };
 }
 
 function shouldRetryImageEditWithUrlBody(error: unknown) {
     const message = readAxiosError(error, "").toLowerCase();
-    return /image url|extra_body\.image|file uploads are not supported|multipart|form-?data|require an image url|must be a url|image must be a string|invalid image|unsupported media type|content-type/.test(message);
+    return /image url|extra_body\.image|file uploads are not supported|multipart|form-?data|require an image url|must be a url|image must be a string|invalid image|unsupported media type|content-type|application\/json|仅支持\s*application\/json|图片编辑仅支持|只支持\s*application\/json|json only|expects application\/json/.test(message);
 }
 
 function isSeedreamModel(model: string | undefined, baseUrl?: string) {
@@ -788,7 +859,9 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
         }
     }
     const quality = normalizeQuality(config.quality);
+    const requestChannel = resolveModelChannel(config, config.model || config.imageModel);
     const requestSize = resolveRequestSize(quality, config.size, requestConfig.model, requestConfig.baseUrl);
+    const geometry = buildImageGeometryFields(requestSize, requestConfig.model, requestConfig.baseUrl, requestChannel.name);
     try {
         const response = await axios.post<ImageApiResponse>(
             aiApiUrl(requestConfig, "/images/generations"),
@@ -797,7 +870,7 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
                 prompt: withSystemPrompt(requestConfig, prompt),
                 n,
                 ...(quality ? { quality } : {}),
-                ...(requestSize ? { size: requestSize } : {}),
+                ...geometry,
                 response_format: "b64_json",
             },
             {
@@ -863,6 +936,8 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             size: requestSize,
             imageUrls,
             maskUrl,
+            baseUrl: requestConfig.baseUrl,
+            channelName: requestChannel.name,
         });
         const response = await axios.post<ImageApiResponse>(aiApiUrl(requestConfig, "/images/edits"), body, {
             headers: aiHeaders(requestConfig, "application/json"),
